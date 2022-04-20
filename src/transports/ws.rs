@@ -1,6 +1,6 @@
 use crate::{
     provider::ProviderError,
-    transports::common::{JsonRpcError, Request},
+    transports::common::{JsonRpcError, Notification, Request, Response},
     JsonRpcClient, PubsubClient,
 };
 use ethers_core::types::U256;
@@ -11,11 +11,7 @@ use futures_util::{
     sink::{Sink, SinkExt},
     stream::{Fuse, Stream, StreamExt},
 };
-use serde::{
-    de::{DeserializeOwned, Error},
-    Serialize,
-};
-use serde_json::value::RawValue;
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fmt::{self, Debug},
@@ -25,8 +21,6 @@ use std::{
     },
 };
 use thiserror::Error;
-
-use super::common::{Notification, Response};
 
 if_wasm! {
     use wasm_bindgen::prelude::*;
@@ -65,14 +59,11 @@ if_not_wasm! {
     type Message = tungstenite::protocol::Message;
     type WsError = tungstenite::Error;
     type WsStreamItem = Result<Message, WsError>;
-    use super::Authorization;
     use tracing::{debug, error, warn};
-    use http::Request as HttpRequest;
-    use tungstenite::client::IntoClientRequest;
 }
 
-type Pending = oneshot::Sender<Result<Box<RawValue>, JsonRpcError>>;
-type Subscription = mpsc::UnboundedSender<Box<RawValue>>;
+type Pending = oneshot::Sender<Result<serde_json::Value, JsonRpcError>>;
+type Subscription = mpsc::UnboundedSender<serde_json::Value>;
 
 /// Instructions for the `WsServer`.
 enum Instruction {
@@ -82,6 +73,13 @@ enum Instruction {
     Subscribe { id: U256, sink: Subscription },
     /// Cancel an existing subscription
     Unsubscribe { id: U256 },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum Incoming {
+    Notification(Notification<serde_json::Value>),
+    Response(Response<serde_json::Value>),
 }
 
 /// A JSON-RPC Client over Websockets.
@@ -114,6 +112,7 @@ impl Ws {
         S: Send + Sync + Stream<Item = WsStreamItem> + Sink<Message, Error = WsError> + Unpin,
     {
         let (sink, stream) = mpsc::unbounded();
+
         // Spawn the server
         WsServer::new(ws, stream).spawn();
 
@@ -135,24 +134,11 @@ impl Ws {
 
     /// Initializes a new WebSocket Client
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn connect(url: impl IntoClientRequest + Unpin) -> Result<Self, ClientError> {
+    pub async fn connect(
+        url: impl tungstenite::client::IntoClientRequest + Unpin,
+    ) -> Result<Self, ClientError> {
         let (ws, _) = connect_async(url).await?;
         Ok(Self::new(ws))
-    }
-
-    /// Initializes a new WebSocket Client with authentication
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn connect_with_auth(
-        uri: impl IntoClientRequest + Unpin,
-        auth: Authorization,
-    ) -> Result<Self, ClientError> {
-        let mut request: HttpRequest<()> = uri.into_client_request()?;
-
-        let mut auth_value = http::HeaderValue::from_str(&auth.to_string())?;
-        auth_value.set_sensitive(true);
-
-        request.headers_mut().insert(http::header::AUTHORIZATION, auth_value);
-        Self::connect(request).await
     }
 
     fn send(&self, msg: Instruction) -> Result<(), ClientError> {
@@ -183,16 +169,19 @@ impl JsonRpcClient for Ws {
         // send the data
         self.send(payload)?;
 
-        // wait for the response (the request itself may have errors as well)
-        let res = receiver.await??;
+        // wait for the response
+        let res = receiver.await?;
+
+        // in case the request itself has any errors
+        let res = res?;
 
         // parse it
-        Ok(serde_json::from_str(res.get())?)
+        Ok(serde_json::from_value(res)?)
     }
 }
 
 impl PubsubClient for Ws {
-    type NotificationStream = mpsc::UnboundedReceiver<Box<RawValue>>;
+    type NotificationStream = mpsc::UnboundedReceiver<serde_json::Value>;
 
     fn subscribe<T: Into<U256>>(&self, id: T) -> Result<Self::NotificationStream, ClientError> {
         let (sink, stream) = mpsc::unbounded();
@@ -320,35 +309,29 @@ where
     }
 
     async fn handle_text(&mut self, inner: String) -> Result<(), ClientError> {
-        if let Ok(response) = serde_json::from_str::<Response<'_>>(&inner) {
-            if let Some(request) = self.pending.remove(&response.id()) {
-                if !request.is_canceled() {
-                    request.send(response.into_result()).map_err(to_client_error)?;
-                }
-            }
-
-            return Ok(())
-        }
-
-        if let Ok(notification) = serde_json::from_str::<Notification<'_>>(&inner) {
-            let id = notification.params.subscription;
-            if let Entry::Occupied(stream) = self.subscriptions.entry(id) {
-                if let Err(err) = stream.get().unbounded_send(notification.params.result.to_owned())
-                {
-                    if err.is_disconnected() {
-                        // subscription channel was closed on the receiver end
-                        stream.remove();
+        match serde_json::from_str::<Incoming>(&inner) {
+            Err(_) => {}
+            Ok(Incoming::Response(resp)) => {
+                if let Some(request) = self.pending.remove(&resp.id) {
+                    if !request.is_canceled() {
+                        request.send(resp.data.into_result()).map_err(to_client_error)?;
                     }
-                    return Err(to_client_error(err))
                 }
             }
-
-            return Ok(())
+            Ok(Incoming::Notification(notification)) => {
+                let id = notification.params.subscription;
+                if let Entry::Occupied(stream) = self.subscriptions.entry(id) {
+                    if let Err(err) = stream.get().unbounded_send(notification.params.result) {
+                        if err.is_disconnected() {
+                            // subscription channel was closed on the receiver end
+                            stream.remove();
+                        }
+                        return Err(to_client_error(err))
+                    }
+                }
+            }
         }
-
-        Err(ClientError::JsonError(serde_json::Error::custom(
-            "response is neither a valid jsonrpc response nor notification",
-        )))
+        Ok(())
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -363,7 +346,6 @@ where
     async fn handle(&mut self, resp: Message) -> Result<(), ClientError> {
         match resp {
             Message::Text(inner) => self.handle_text(inner).await,
-            Message::Frame(_) => Ok(()), // Server is allowed to send Raw frames
             Message::Ping(inner) => self.handle_ping(inner).await,
             Message::Pong(_) => Ok(()), // Server is allowed to send unsolicited pongs.
             Message::Close(Some(frame)) => Err(ClientError::WsClosed(frame)),
@@ -460,21 +442,6 @@ pub enum ClientError {
     /// Something caused the websocket to close
     #[error("WebSocket connection closed unexpectedly")]
     UnexpectedClose,
-
-    /// Could not create an auth header for websocket handshake
-    #[error(transparent)]
-    #[cfg(not(target_arch = "wasm32"))]
-    WsAuth(#[from] http::header::InvalidHeaderValue),
-
-    /// Unable to create a valid Uri
-    #[error(transparent)]
-    #[cfg(not(target_arch = "wasm32"))]
-    UriError(#[from] http::uri::InvalidUri),
-
-    /// Unable to create a valid Request
-    #[error(transparent)]
-    #[cfg(not(target_arch = "wasm32"))]
-    RequestError(#[from] http::Error),
 }
 
 impl From<ClientError> for ProviderError {
@@ -517,21 +484,11 @@ mod tests {
         let mut blocks = Vec::new();
         for _ in 0..3 {
             let item = stream.next().await.unwrap();
-            let block: Block<TxHash> = serde_json::from_str(item.get()).unwrap();
+            let block = serde_json::from_value::<Block<TxHash>>(item).unwrap();
             blocks.push(block.number.unwrap_or_default().as_u64());
         }
 
         assert_eq!(sub_id, 1.into());
         assert_eq!(blocks, vec![1, 2, 3])
-    }
-
-    #[tokio::test]
-    async fn deserialization_fails() {
-        let ganache = Ganache::new().block_time(1u64).spawn();
-        let (ws, _) = tokio_tungstenite::connect_async(ganache.ws_endpoint()).await.unwrap();
-        let malformed_data = String::from("not a valid message");
-        let (_, stream) = mpsc::unbounded();
-        let resp = WsServer::new(ws, stream).handle_text(malformed_data).await;
-        assert!(resp.is_err(), "Deserialization should not fail silently");
     }
 }

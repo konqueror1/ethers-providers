@@ -1,6 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(unsafe_code)]
-#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(broken_intra_doc_links)]
 #![allow(clippy::type_complexity)]
 #![doc = include_str!("../README.md")]
 mod transports;
@@ -25,14 +24,11 @@ pub use stream::{interval, FilterWatcher, TransactionStream, DEFAULT_POLL_INTERV
 mod pubsub;
 pub use pubsub::{PubsubClient, SubscriptionStream};
 
-pub mod erc;
-
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use ethers_core::types::transaction::{eip2718::TypedTransaction, eip2930::AccessListWithGasUsed};
-use serde::{de::DeserializeOwned, Serialize};
-use std::{error::Error, fmt::Debug, future::Future, pin::Pin};
-use url::Url;
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use std::{error::Error, fmt::Debug, future::Future, pin::Pin, str::FromStr};
 
 pub use provider::{FilterKind, Provider, ProviderError};
 
@@ -81,15 +77,6 @@ where
     } else {
         f.await
     }
-}
-
-/// Structure used in eth_syncing RPC
-#[derive(Clone, Debug)]
-pub enum SyncingStatus {
-    /// When client is synced to highest block, eth_syncing with return string "false"
-    IsFalse,
-    /// When client is still syncing past blocks we get IsSyncing information.
-    IsSyncing { starting_block: U256, current_block: U256, highest_block: U256 },
 }
 
 /// A middleware allows customizing requests send and received from an ethereum node.
@@ -172,33 +159,66 @@ pub trait Middleware: Sync + Send + Debug {
         self.inner().client_version().await.map_err(FromErr::from)
     }
 
-    /// Fill necessary details of a transaction for dispatch
-    ///
-    /// This function is defined on providers to behave as follows:
-    /// 1. populate the `from` field with the default sender
-    /// 2. resolve any ENS names in the tx `to` field
-    /// 3. Estimate gas usage _without_ access lists
-    /// 4. Estimate gas usage _with_ access lists
-    /// 5. Enable access lists IFF they are cheaper
-    /// 6. Poll and set legacy or 1559 gas prices
-    /// 7. Set the chain_id with the provider's, if not already set
-    ///
-    /// It does NOT set the nonce by default.
-    /// It MAY override the gas amount set by the user, if access lists are
-    /// cheaper.
-    ///
-    /// Middleware are encouraged to override any values _before_ delegating
-    /// to the inner implementation AND/OR modify the values provided by the
-    /// default implementation _after_ delegating.
-    ///
-    /// E.g. a middleware wanting to double gas prices should consider doing so
-    /// _after_ delegating and allowing the default implementation to poll gas.
+    /// Helper for filling a transaction
     async fn fill_transaction(
         &self,
         tx: &mut TypedTransaction,
         block: Option<BlockId>,
     ) -> Result<(), Self::Error> {
-        self.inner().fill_transaction(tx, block).await.map_err(FromErr::from)
+        if let Some(default_sender) = self.default_sender() {
+            if tx.from().is_none() {
+                tx.set_from(default_sender);
+            }
+        }
+
+        // TODO: Can we poll the futures below at the same time?
+        // Access List + Name resolution and then Gas price + Gas
+
+        // set the ENS name
+        if let Some(NameOrAddress::Name(ref ens_name)) = tx.to() {
+            let addr = self.resolve_name(ens_name).await?;
+            tx.set_to(addr);
+        }
+
+        // estimate the gas without the access list
+        let gas = maybe(tx.gas().cloned(), self.estimate_gas(tx)).await?;
+        let mut al_used = false;
+
+        // set the access lists
+        if let Some(access_list) = tx.access_list() {
+            if access_list.0.is_empty() {
+                if let Ok(al_with_gas) = self.create_access_list(tx, block).await {
+                    // only set the access list if the used gas is less than the
+                    // normally estimated gas
+                    if al_with_gas.gas_used < gas {
+                        tx.set_access_list(al_with_gas.access_list);
+                        tx.set_gas(al_with_gas.gas_used);
+                        al_used = true;
+                    }
+                }
+            }
+        }
+
+        if !al_used {
+            tx.set_gas(gas);
+        }
+
+        match tx {
+            TypedTransaction::Eip2930(_) | TypedTransaction::Legacy(_) => {
+                let gas_price = maybe(tx.gas_price(), self.get_gas_price()).await?;
+                tx.set_gas_price(gas_price);
+            }
+            TypedTransaction::Eip1559(ref mut inner) => {
+                if inner.max_fee_per_gas.is_none() || inner.max_priority_fee_per_gas.is_none() {
+                    let (max_fee_per_gas, max_priority_fee_per_gas) =
+                        self.estimate_eip1559_fees(None).await?;
+                    inner.max_fee_per_gas = Some(max_fee_per_gas);
+                    inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
+                };
+            }
+        }
+
+        Ok(())
     }
 
     async fn get_block_number(&self) -> Result<U64, Self::Error> {
@@ -228,15 +248,8 @@ pub trait Middleware: Sync + Send + Debug {
     ) -> Result<EscalatingPending<'a, Self::Provider>, Self::Error> {
         let mut original = tx.clone();
         self.fill_transaction(&mut original, None).await?;
-
-        // set the nonce, if no nonce is found
-        if original.nonce().is_none() {
-            let nonce =
-                self.get_transaction_count(tx.from().copied().unwrap_or_default(), None).await?;
-            original.set_nonce(nonce);
-        }
-
         let gas_price = original.gas_price().expect("filled");
+        let chain_id = self.get_chainid().await?.low_u64();
         let sign_futs: Vec<_> = (0..escalations)
             .map(|i| {
                 let new_price = policy(gas_price, i);
@@ -247,7 +260,7 @@ pub trait Middleware: Sync + Send + Debug {
             .map(|req| async move {
                 self.sign_transaction(&req, self.default_sender().unwrap_or_default())
                     .await
-                    .map(|sig| req.rlp_signed(&sig))
+                    .map(|sig| req.rlp_signed(chain_id, &sig))
             })
             .collect();
 
@@ -265,18 +278,6 @@ pub trait Middleware: Sync + Send + Debug {
 
     async fn lookup_address(&self, address: Address) -> Result<String, Self::Error> {
         self.inner().lookup_address(address).await.map_err(FromErr::from)
-    }
-
-    async fn resolve_avatar(&self, ens_name: &str) -> Result<Url, Self::Error> {
-        self.inner().resolve_avatar(ens_name).await.map_err(FromErr::from)
-    }
-
-    async fn resolve_nft(&self, token: erc::ERCNFT) -> Result<Url, Self::Error> {
-        self.inner().resolve_nft(token).await.map_err(FromErr::from)
-    }
-
-    async fn resolve_field(&self, ens_name: &str, field: &str) -> Result<String, Self::Error> {
-        self.inner().resolve_field(ens_name, field).await.map_err(FromErr::from)
     }
 
     async fn get_block<T: Into<BlockId> + Send + Sync>(
@@ -326,10 +327,6 @@ pub trait Middleware: Sync + Send + Debug {
         block: Option<BlockId>,
     ) -> Result<Bytes, Self::Error> {
         self.inner().call(tx, block).await.map_err(FromErr::from)
-    }
-
-    async fn syncing(&self) -> Result<SyncingStatus, Self::Error> {
-        self.inner().syncing().await.map_err(FromErr::from)
     }
 
     async fn get_chainid(&self) -> Result<U256, Self::Error> {
@@ -509,14 +506,6 @@ pub trait Middleware: Sync + Send + Debug {
         self.inner().trace_call(req, trace_type, block).await.map_err(FromErr::from)
     }
 
-    async fn trace_call_many<T: Into<TypedTransaction> + Send + Sync>(
-        &self,
-        req: Vec<(T, Vec<TraceType>)>,
-        block: Option<BlockNumber>,
-    ) -> Result<Vec<BlockTrace>, Self::Error> {
-        self.inner().trace_call_many(req, block).await.map_err(FromErr::from)
-    }
-
     /// Traces a call to `eth_sendRawTransaction` without making the call, returning the traces
     async fn trace_raw_transaction(
         &self,
@@ -647,6 +636,36 @@ pub trait Middleware: Sync + Send + Debug {
     }
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeHistory {
+    pub base_fee_per_gas: Vec<U256>,
+    pub gas_used_ratio: Vec<f64>,
+    #[serde(deserialize_with = "from_int_or_hex")]
+    /// oldestBlock is returned as an unsigned integer up to geth v1.10.6. From
+    /// geth v1.10.7, this has been updated to return in the hex encoded form.
+    /// The custom deserializer allows backward compatibility for those clients
+    /// not running v1.10.7 yet.
+    pub oldest_block: U256,
+    pub reward: Vec<Vec<U256>>,
+}
+
+fn from_int_or_hex<'de, D>(deserializer: D) -> Result<U256, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrHex {
+        Int(u64),
+        Hex(String),
+    }
+    match IntOrHex::deserialize(deserializer)? {
+        IntOrHex::Int(n) => Ok(U256::from(n)),
+        IntOrHex::Hex(s) => U256::from_str(s.as_str()).map_err(serde::de::Error::custom),
+    }
+}
+
 #[cfg(feature = "celo")]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -656,65 +675,5 @@ pub trait CeloMiddleware: Middleware {
         block_id: T,
     ) -> Result<Vec<String>, ProviderError> {
         self.provider().get_validators_bls_public_keys(block_id).await.map_err(FromErr::from)
-    }
-}
-
-pub use test_provider::{GOERLI, MAINNET, RINKEBY, ROPSTEN};
-
-/// Pre-instantiated Infura HTTP clients which rotate through multiple API keys
-/// to prevent rate limits
-pub mod test_provider {
-    use super::*;
-    use crate::Http;
-    use once_cell::sync::Lazy;
-    use std::{convert::TryFrom, iter::Cycle, slice::Iter, sync::Mutex};
-
-    // List of infura keys to rotate through so we don't get rate limited
-    const INFURA_KEYS: &[&str] = &[
-        "6770454bc6ea42c58aac12978531b93f",
-        "7a8769b798b642f6933f2ed52042bd70",
-        "631fd9a6539644088297dc605d35fff3",
-        "16a8be88795540b9b3903d8de0f7baa5",
-        "f4a0bdad42674adab5fc0ac077ffab2b",
-        "5c812e02193c4ba793f8c214317582bd",
-    ];
-
-    pub static RINKEBY: Lazy<TestProvider> =
-        Lazy::new(|| TestProvider::new(INFURA_KEYS, "rinkeby"));
-    pub static MAINNET: Lazy<TestProvider> =
-        Lazy::new(|| TestProvider::new(INFURA_KEYS, "mainnet"));
-    pub static GOERLI: Lazy<TestProvider> = Lazy::new(|| TestProvider::new(INFURA_KEYS, "goerli"));
-    pub static ROPSTEN: Lazy<TestProvider> =
-        Lazy::new(|| TestProvider::new(INFURA_KEYS, "ropsten"));
-
-    #[derive(Debug)]
-    pub struct TestProvider {
-        network: String,
-        keys: Mutex<Cycle<Iter<'static, &'static str>>>,
-    }
-
-    impl TestProvider {
-        pub fn new(keys: &'static [&'static str], network: &str) -> Self {
-            Self { keys: Mutex::new(keys.iter().cycle()), network: network.to_owned() }
-        }
-
-        pub fn provider(&self) -> Provider<Http> {
-            let url = format!(
-                "https://{}.infura.io/v3/{}",
-                self.network,
-                self.keys.lock().unwrap().next().unwrap()
-            );
-            Provider::try_from(url.as_str()).unwrap()
-        }
-
-        #[cfg(feature = "ws")]
-        pub async fn ws(&self) -> Provider<crate::Ws> {
-            let url = format!(
-                "wss://{}.infura.io/ws/v3/{}",
-                self.network,
-                self.keys.lock().unwrap().next().unwrap()
-            );
-            Provider::connect(url.as_str()).await.unwrap()
-        }
     }
 }

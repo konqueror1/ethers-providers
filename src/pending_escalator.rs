@@ -1,5 +1,3 @@
-#![allow(clippy::return_self_not_must_use)]
-
 use ethers_core::types::{Bytes, TransactionReceipt, H256};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use pin_project::pin_project;
@@ -128,15 +126,6 @@ macro_rules! completed {
     };
 }
 
-/// Tests Provider error for nonce too low issue through debug contents
-fn is_nonce_too_low(e: &ProviderError) -> bool {
-    let debug_str = format!("{:?}", e);
-
-    debug_str.contains("nonce too low") // Geth, Arbitrum, Optimism
-            || debug_str.contains("nonce is too low") // Parity
-            || debug_str.contains("invalid transaction nonce") // Arbitrum
-}
-
 macro_rules! poll_broadcast_fut {
     ($cx:ident, $this:ident, $fut:ident) => {
         match $fut.as_mut().poll($cx) {
@@ -153,7 +142,7 @@ macro_rules! poll_broadcast_fut {
             Poll::Ready(Err(e)) => {
                 // kludge. Prevents erroring on "nonce too low" which indicates
                 // a previous escalation confirmed during this broadcast attempt
-                if is_nonce_too_low(&e) {
+                if format!("{:?}", e).contains("nonce too low") {
                     check_all_receipts!($cx, $this);
                 } else {
                     tracing::error!(

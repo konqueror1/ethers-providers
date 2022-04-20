@@ -1,9 +1,9 @@
 use crate::{
-    ens, erc, maybe,
+    ens,
     pubsub::{PubsubClient, SubscriptionStream},
     stream::{FilterWatcher, DEFAULT_POLL_INTERVAL},
-    FromErr, Http as HttpProvider, JsonRpcClient, JsonRpcClientWrapper, MockProvider,
-    PendingTransaction, QuorumProvider, RwClient, SyncingStatus,
+    FeeHistory, FromErr, Http as HttpProvider, JsonRpcClient, JsonRpcClientWrapper, MockProvider,
+    PendingTransaction, QuorumProvider,
 };
 
 #[cfg(feature = "celo")]
@@ -15,19 +15,18 @@ use ethers_core::{
     abi::{self, Detokenize, ParamType},
     types::{
         transaction::{eip2718::TypedTransaction, eip2930::AccessListWithGasUsed},
-        Address, Block, BlockId, BlockNumber, BlockTrace, Bytes, EIP1186ProofResponse, FeeHistory,
-        Filter, Log, NameOrAddress, Selector, Signature, Trace, TraceFilter, TraceType,
-        Transaction, TransactionReceipt, TransactionRequest, TxHash, TxpoolContent, TxpoolInspect,
-        TxpoolStatus, H256, U256, U64,
+        Address, Block, BlockId, BlockNumber, BlockTrace, Bytes, EIP1186ProofResponse, Filter, Log,
+        NameOrAddress, Selector, Signature, Trace, TraceFilter, TraceType, Transaction,
+        TransactionReceipt, TxHash, TxpoolContent, TxpoolInspect, TxpoolStatus, H256, U256, U64,
     },
     utils,
 };
 use hex::FromHex;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 use url::{ParseError, Url};
 
-use futures_util::{lock::Mutex, try_join};
+use futures_util::lock::Mutex;
 use std::{convert::TryFrom, fmt::Debug, str::FromStr, sync::Arc, time::Duration};
 use tracing::trace;
 use tracing_futures::Instrument;
@@ -112,18 +111,11 @@ pub enum ProviderError {
     #[error("ens name not found: {0}")]
     EnsError(String),
 
-    /// Invalid reverse ENS name
-    #[error("reverse ens name not pointing to itself: {0}")]
-    EnsNotOwned(String),
-
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
 
     #[error(transparent)]
     HexError(#[from] hex::FromHexError),
-
-    #[error(transparent)]
-    HTTPError(#[from] reqwest::Error),
 
     #[error("custom error: {0}")]
     CustomError(String),
@@ -182,13 +174,12 @@ impl<P: JsonRpcClient> Provider<P> {
         }
     }
 
-    #[must_use]
     pub fn with_sender(mut self, address: impl Into<Address>) -> Self {
         self.from = Some(address.into());
         self
     }
 
-    pub async fn request<T, R>(&self, method: &str, params: T) -> Result<R, ProviderError>
+    async fn request<T, R>(&self, method: &str, params: T) -> Result<R, ProviderError>
     where
         T: Debug + Serialize + Send + Sync,
         R: Serialize + DeserializeOwned + Debug,
@@ -266,75 +257,6 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
     /// Returns the current client version using the `web3_clientVersion` RPC.
     async fn client_version(&self) -> Result<String, Self::Error> {
         self.request("web3_clientVersion", ()).await
-    }
-
-    async fn fill_transaction(
-        &self,
-        tx: &mut TypedTransaction,
-        block: Option<BlockId>,
-    ) -> Result<(), Self::Error> {
-        if let Some(default_sender) = self.default_sender() {
-            if tx.from().is_none() {
-                tx.set_from(default_sender);
-            }
-        }
-
-        // TODO: Join the name resolution and gas price future
-
-        // set the ENS name
-        if let Some(NameOrAddress::Name(ref ens_name)) = tx.to() {
-            let addr = self.resolve_name(ens_name).await?;
-            tx.set_to(addr);
-        }
-
-        // fill gas price
-        match tx {
-            TypedTransaction::Eip2930(_) | TypedTransaction::Legacy(_) => {
-                let gas_price = maybe(tx.gas_price(), self.get_gas_price()).await?;
-                tx.set_gas_price(gas_price);
-            }
-            TypedTransaction::Eip1559(ref mut inner) => {
-                if inner.max_fee_per_gas.is_none() || inner.max_priority_fee_per_gas.is_none() {
-                    let (max_fee_per_gas, max_priority_fee_per_gas) =
-                        self.estimate_eip1559_fees(None).await?;
-                    inner.max_fee_per_gas = Some(max_fee_per_gas);
-                    inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
-                };
-            }
-        }
-
-        // If the tx has an access list but it is empty, it is an Eip1559 or Eip2930 tx,
-        // and we attempt to populate the acccess list. This may require `eth_estimateGas`,
-        // in which case we save the result in maybe_gas_res for later
-        let mut maybe_gas = None;
-        if let Some(starting_al) = tx.access_list() {
-            if starting_al.0.is_empty() {
-                let (gas_res, al_res) = futures_util::join!(
-                    maybe(tx.gas().cloned(), self.estimate_gas(tx)),
-                    self.create_access_list(tx, block)
-                );
-                let mut gas = gas_res?;
-
-                if let Ok(al_with_gas) = al_res {
-                    // Set access list if it saves gas over the estimated (or previously set) value
-                    if al_with_gas.gas_used < gas {
-                        // Update the gas estimate with the lower amount
-                        gas = al_with_gas.gas_used;
-                        tx.set_access_list(al_with_gas.access_list);
-                    }
-                }
-                maybe_gas = Some(gas);
-            }
-        }
-
-        // Set gas to estimated value only if it was not set by the caller,
-        // even if the access list has been populated and saves gas
-        if tx.gas().is_none() {
-            let gas_estimate = maybe(maybe_gas, self.estimate_gas(tx)).await?;
-            tx.set_gas(gas_estimate);
-        }
-
-        Ok(())
     }
 
     /// Gets the latest block number via the `eth_BlockNumber` API
@@ -510,30 +432,6 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
     /// transaction signing as introduced by EIP-155.
     async fn get_chainid(&self) -> Result<U256, ProviderError> {
         self.request("eth_chainId", ()).await
-    }
-
-    /// Return current client syncing status. If IsFalse sync is over.
-    async fn syncing(&self) -> Result<SyncingStatus, Self::Error> {
-        #[derive(Debug, Serialize, Deserialize)]
-        #[serde(untagged)]
-        pub enum SyncingStatusIntermediate {
-            /// When client is synced to highest block, eth_syncing with return string "false"
-            IsFalse(bool),
-            /// When client is still syncing past blocks we get IsSyncing information.
-            IsSyncing { starting_block: U256, current_block: U256, highest_block: U256 },
-        }
-        let intermediate: SyncingStatusIntermediate = self.request("eth_syncing", ()).await?;
-        match intermediate {
-            SyncingStatusIntermediate::IsFalse(false) => Ok(SyncingStatus::IsFalse),
-            SyncingStatusIntermediate::IsFalse(true) => Err(ProviderError::CustomError(
-                "eth_syncing returned `true` that is undefined value.".to_owned(),
-            )),
-            SyncingStatusIntermediate::IsSyncing {
-                starting_block,
-                current_block,
-                highest_block,
-            } => Ok(SyncingStatus::IsSyncing { starting_block, current_block, highest_block }),
-        }
     }
 
     /// Returns the network version.
@@ -754,7 +652,7 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
     }
 
     /// Returns the EIP-1186 proof response
-    /// <https://github.com/ethereum/EIPs/issues/1186>
+    /// https://github.com/ethereum/EIPs/issues/1186
     async fn get_proof<T: Into<NameOrAddress> + Send + Sync>(
         &self,
         from: T,
@@ -798,151 +696,7 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
     /// a string. This should theoretically never happen.
     async fn lookup_address(&self, address: Address) -> Result<String, ProviderError> {
         let ens_name = ens::reverse_address(address);
-        let domain: String =
-            self.query_resolver(ParamType::String, &ens_name, ens::NAME_SELECTOR).await?;
-        let reverse_address = self.resolve_name(&domain).await?;
-        if address != reverse_address {
-            Err(ProviderError::EnsNotOwned(domain))
-        } else {
-            Ok(domain)
-        }
-    }
-
-    /// Returns the avatar HTTP link of the avatar that the `ens_name` resolves to (or None
-    /// if not configured)
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use ethers_providers::{Provider, Http as HttpProvider, Middleware};
-    /// # use std::convert::TryFrom;
-    /// # #[tokio::main(flavor = "current_thread")]
-    /// # async fn main() {
-    /// # let provider = Provider::<HttpProvider>::try_from("https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27").unwrap();
-    /// let avatar = provider.resolve_avatar("parishilton.eth").await.unwrap();
-    /// assert_eq!(avatar.to_string(), "https://i.imgur.com/YW3Hzph.jpg");
-    /// # }
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// If the bytes returned from the ENS registrar/resolver cannot be interpreted as
-    /// a string. This should theoretically never happen.
-    async fn resolve_avatar(&self, ens_name: &str) -> Result<Url, ProviderError> {
-        let (field, owner) =
-            try_join!(self.resolve_field(ens_name, "avatar"), self.resolve_name(ens_name))?;
-        let url = Url::from_str(&field).map_err(|e| ProviderError::CustomError(e.to_string()))?;
-        match url.scheme() {
-            "https" | "data" => Ok(url),
-            "ipfs" => erc::http_link_ipfs(url).map_err(ProviderError::CustomError),
-            "eip155" => {
-                let token =
-                    erc::ERCNFT::from_str(url.path()).map_err(ProviderError::CustomError)?;
-                match token.type_ {
-                    erc::ERCNFTType::ERC721 => {
-                        let tx = TransactionRequest {
-                            data: Some(
-                                [&erc::ERC721_OWNER_SELECTOR[..], &token.id].concat().into(),
-                            ),
-                            to: Some(NameOrAddress::Address(token.contract)),
-                            ..Default::default()
-                        };
-                        let data = self.call(&tx.into(), None).await?;
-                        if decode_bytes::<Address>(ParamType::Address, data) != owner {
-                            return Err(ProviderError::CustomError("Incorrect owner.".to_string()))
-                        }
-                    }
-                    erc::ERCNFTType::ERC1155 => {
-                        let tx = TransactionRequest {
-                            data: Some(
-                                [
-                                    &erc::ERC1155_BALANCE_SELECTOR[..],
-                                    &[0x0; 12],
-                                    &owner.0,
-                                    &token.id,
-                                ]
-                                .concat()
-                                .into(),
-                            ),
-                            to: Some(NameOrAddress::Address(token.contract)),
-                            ..Default::default()
-                        };
-                        let data = self.call(&tx.into(), None).await?;
-                        if decode_bytes::<u64>(ParamType::Uint(64), data) == 0 {
-                            return Err(ProviderError::CustomError("Incorrect balance.".to_string()))
-                        }
-                    }
-                }
-
-                let image_url = self.resolve_nft(token).await?;
-                match image_url.scheme() {
-                    "https" | "data" => Ok(image_url),
-                    "ipfs" => erc::http_link_ipfs(image_url).map_err(ProviderError::CustomError),
-                    _ => Err(ProviderError::CustomError(
-                        "Unsupported scheme for the image".to_string(),
-                    )),
-                }
-            }
-            _ => Err(ProviderError::CustomError("Unsupported scheme".to_string())),
-        }
-    }
-
-    /// Returns the URL (not necesserily HTTP) of the image behind a token.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use ethers_providers::{Provider, Http as HttpProvider, Middleware};
-    /// # use std::{str::FromStr, convert::TryFrom};
-    /// # #[tokio::main(flavor = "current_thread")]
-    /// # async fn main() {
-    /// # let provider = Provider::<HttpProvider>::try_from("https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27").unwrap();
-    /// let token = ethers_providers::erc::ERCNFT::from_str("erc721:0xc92ceddfb8dd984a89fb494c376f9a48b999aafc/9018").unwrap();
-    /// let token_image = provider.resolve_nft(token).await.unwrap();
-    /// assert_eq!(token_image.to_string(), "https://creature.mypinata.cloud/ipfs/QmNwj3aUzXfG4twV3no7hJRYxLLAWNPk6RrfQaqJ6nVJFa/9018.jpg");
-    /// # }
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// If the bytes returned from the ENS registrar/resolver cannot be interpreted as
-    /// a string. This should theoretically never happen.
-    async fn resolve_nft(&self, token: erc::ERCNFT) -> Result<Url, ProviderError> {
-        let selector = token.type_.resolution_selector();
-        let tx = TransactionRequest {
-            data: Some([&selector[..], &token.id].concat().into()),
-            to: Some(NameOrAddress::Address(token.contract)),
-            ..Default::default()
-        };
-        let data = self.call(&tx.into(), None).await?;
-        let mut metadata_url = Url::parse(&decode_bytes::<String>(ParamType::String, data))
-            .map_err(|e| ProviderError::CustomError(format!("Invalid metadata url: {}", e)))?;
-
-        if token.type_ == erc::ERCNFTType::ERC1155 {
-            metadata_url
-                .set_path(&metadata_url.path().replace("%7Bid%7D", &hex::encode(&token.id)));
-        }
-        if metadata_url.scheme() == "ipfs" {
-            metadata_url = erc::http_link_ipfs(metadata_url).map_err(ProviderError::CustomError)?;
-        }
-        let metadata: erc::Metadata = reqwest::get(metadata_url).await?.json().await?;
-        Url::parse(&metadata.image).map_err(|e| ProviderError::CustomError(e.to_string()))
-    }
-
-    /// Fetch a field for the `ens_name` (no None if not configured).
-    ///
-    /// # Panics
-    ///
-    /// If the bytes returned from the ENS registrar/resolver cannot be interpreted as
-    /// a string. This should theoretically never happen.
-    async fn resolve_field(&self, ens_name: &str, field: &str) -> Result<String, ProviderError> {
-        let field: String = self
-            .query_resolver_parameters(
-                ParamType::String,
-                ens_name,
-                ens::FIELD_SELECTOR,
-                Some(&ens::parameterhash(field)),
-            )
-            .await?;
-        Ok(field)
+        self.query_resolver(ParamType::String, &ens_name, ens::NAME_SELECTOR).await
     }
 
     /// Returns the details of all transactions currently pending for inclusion in the next
@@ -978,19 +732,6 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         let block = utils::serialize(&block.unwrap_or(BlockNumber::Latest));
         let trace_type = utils::serialize(&trace_type);
         self.request("trace_call", [req, trace_type, block]).await
-    }
-
-    /// Executes given calls and returns a number of possible traces for each call
-    async fn trace_call_many<T: Into<TypedTransaction> + Send + Sync>(
-        &self,
-        req: Vec<(T, Vec<TraceType>)>,
-        block: Option<BlockNumber>,
-    ) -> Result<Vec<BlockTrace>, ProviderError> {
-        let req: Vec<(TypedTransaction, Vec<TraceType>)> =
-            req.into_iter().map(|(tx, trace_type)| (tx.into(), trace_type)).collect();
-        let req = utils::serialize(&req);
-        let block = utils::serialize(&block.unwrap_or(BlockNumber::Latest));
-        self.request("trace_callMany", [req, block]).await
     }
 
     /// Traces a call to `eth_sendRawTransaction` without making the call, returning the traces
@@ -1107,13 +848,12 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         self.subscribe([logs, filter]).await
     }
 
-    async fn fee_history<T: Into<U256> + Send + Sync>(
+    async fn fee_history<T: Into<U256> + serde::Serialize + Send + Sync>(
         &self,
         block_count: T,
         last_block: BlockNumber,
         reward_percentiles: &[f64],
     ) -> Result<FeeHistory, Self::Error> {
-        let block_count = block_count.into();
         let last_block = utils::serialize(&last_block);
         let reward_percentiles = utils::serialize(&reward_percentiles);
 
@@ -1128,7 +868,7 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         .or(self
             .request(
                 "eth_feeHistory",
-                [utils::serialize(&block_count.as_u64()), last_block, reward_percentiles],
+                [utils::serialize(&block_count.into().as_u64()), last_block, reward_percentiles],
             )
             .await)
     }
@@ -1141,16 +881,6 @@ impl<P: JsonRpcClient> Provider<P> {
         ens_name: &str,
         selector: Selector,
     ) -> Result<T, ProviderError> {
-        self.query_resolver_parameters(param, ens_name, selector, None).await
-    }
-
-    async fn query_resolver_parameters<T: Detokenize>(
-        &self,
-        param: ParamType,
-        ens_name: &str,
-        selector: Selector,
-        parameters: Option<&[u8]>,
-    ) -> Result<T, ProviderError> {
         // Get the ENS address, prioritize the local override variable
         let ens_addr = self.ens.unwrap_or(ens::ENS_ADDRESS);
 
@@ -1158,20 +888,14 @@ impl<P: JsonRpcClient> Provider<P> {
         // the call will return a Bytes array which we convert to an address
         let data = self.call(&ens::get_resolver(ens_addr, ens_name).into(), None).await?;
 
-        // otherwise, decode_bytes panics
-        if data.0.is_empty() {
-            return Err(ProviderError::EnsError(ens_name.to_owned()))
-        }
-
         let resolver_address: Address = decode_bytes(ParamType::Address, data);
         if resolver_address == Address::zero() {
             return Err(ProviderError::EnsError(ens_name.to_owned()))
         }
 
         // resolve
-        let data = self
-            .call(&ens::resolve(resolver_address, selector, ens_name, parameters).into(), None)
-            .await?;
+        let data =
+            self.call(&ens::resolve(resolver_address, selector, ens_name).into(), None).await?;
 
         Ok(decode_bytes(param, data))
     }
@@ -1186,7 +910,6 @@ impl<P: JsonRpcClient> Provider<P> {
     }
 
     /// Sets the ENS Address (default: mainnet)
-    #[must_use]
     pub fn ens<T: Into<Address>>(mut self, ens: T) -> Self {
         self.ens = Some(ens.into());
         self
@@ -1194,7 +917,6 @@ impl<P: JsonRpcClient> Provider<P> {
 
     /// Sets the default polling interval for event filters and pending transactions
     /// (default: 7 seconds)
-    #[must_use]
     pub fn interval<T: Into<Duration>>(mut self, interval: T) -> Self {
         self.interval = Some(interval.into());
         self
@@ -1226,25 +948,13 @@ impl Provider<crate::Ws> {
     }
 }
 
-#[cfg(all(target_family = "unix", feature = "ipc"))]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "ipc")]
 impl Provider<crate::Ipc> {
     /// Direct connection to an IPC socket.
     pub async fn connect_ipc(path: impl AsRef<std::path::Path>) -> Result<Self, ProviderError> {
         let ipc = crate::Ipc::connect(path).await?;
         Ok(Self::new(ipc))
-    }
-}
-
-impl<Read, Write> Provider<RwClient<Read, Write>>
-where
-    Read: JsonRpcClient + 'static,
-    <Read as JsonRpcClient>::Error: Sync + Send + 'static,
-    Write: JsonRpcClient + 'static,
-    <Write as JsonRpcClient>::Error: Sync + Send + 'static,
-{
-    /// Creates a new [Provider] with a [RwClient]
-    pub fn rw(r: Read, w: Write) -> Self {
-        Self::new(RwClient::new(r, w))
     }
 }
 
@@ -1311,14 +1021,6 @@ impl TryFrom<String> for Provider<HttpProvider> {
     }
 }
 
-impl<'a> TryFrom<&'a String> for Provider<HttpProvider> {
-    type Error = ParseError;
-
-    fn try_from(src: &'a String) -> Result<Self, Self::Error> {
-        Provider::try_from(src.as_str())
-    }
-}
-
 /// A middleware supporting development-specific JSON RPC methods
 ///
 /// # Example
@@ -1329,7 +1031,7 @@ impl<'a> TryFrom<&'a String> for Provider<HttpProvider> {
 /// use ethers_core::utils::Ganache;
 /// use std::convert::TryFrom;
 ///
-/// # #[tokio::main(flavor = "current_thread")]
+/// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let ganache = Ganache::new().spawn();
 /// let provider = Provider::<Http>::try_from(ganache.endpoint()).unwrap();
@@ -1502,17 +1204,17 @@ mod tests {
     use super::*;
     use crate::Http;
     use ethers_core::{
-        types::{
-            transaction::eip2930::AccessList, Eip1559TransactionRequest, TransactionRequest, H256,
-        },
+        types::{TransactionRequest, H256},
         utils::Geth,
     };
     use futures_util::StreamExt;
 
+    const INFURA: &str = "https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27";
+
     #[tokio::test]
     // Test vector from: https://docs.ethers.io/ethers.js/v5-beta/api-providers.html#id2
     async fn mainnet_resolve_name() {
-        let provider = crate::test_provider::MAINNET.provider();
+        let provider = Provider::<HttpProvider>::try_from(INFURA).unwrap();
 
         let addr = provider.resolve_name("registrar.firefly.eth").await.unwrap();
         assert_eq!(addr, "6fC21092DA55B392b045eD78F4732bff3C580e2c".parse().unwrap());
@@ -1527,7 +1229,7 @@ mod tests {
     #[tokio::test]
     // Test vector from: https://docs.ethers.io/ethers.js/v5-beta/api-providers.html#id2
     async fn mainnet_lookup_address() {
-        let provider = crate::MAINNET.provider();
+        let provider = Provider::<HttpProvider>::try_from(INFURA).unwrap();
 
         let name = provider
             .lookup_address("6fC21092DA55B392b045eD78F4732bff3C580e2c".parse().unwrap())
@@ -1540,30 +1242,6 @@ mod tests {
             .lookup_address("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap())
             .await
             .unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn mainnet_resolve_avatar() {
-        let provider = crate::MAINNET.provider();
-
-        for (ens_name, res) in &[
-            // HTTPS
-            ("alisha.eth", "https://ipfs.io/ipfs/QmeQm91kAdPGnUKsE74WvkqYKUeHvc2oHd2FW11V3TrqkQ"),
-            // ERC-1155
-            ("nick.eth", "https://lh3.googleusercontent.com/hKHZTZSTmcznonu8I6xcVZio1IF76fq0XmcxnvUykC-FGuVJ75UPdLDlKJsfgVXH9wOSmkyHw0C39VAYtsGyxT7WNybjQ6s3fM3macE"),
-            // HTTPS
-            ("parishilton.eth", "https://i.imgur.com/YW3Hzph.jpg"),
-            // ERC-721 with IPFS link
-            ("ikehaya-nft.eth", "https://ipfs.io/ipfs/QmdKkwCE8uVhgYd7tWBfhtHdQZDnbNukWJ8bvQmR6nZKsk"),
-            // ERC-1155 with IPFS link
-            ("vitalik.eth", "https://ipfs.io/ipfs/QmSP4nq9fnN9dAiCj42ug9Wa79rqmQerZXZch82VqpiH7U/image.gif"),
-            // IPFS
-            ("cdixon.eth", "https://ipfs.io/ipfs/QmYA6ZpEARgHvRHZQdFPynMMX8NtdL2JCadvyuyG2oA88u"),
-            ("0age.eth", "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIHN0eWxlPSJiYWNrZ3JvdW5kLWNvbG9yOmJsYWNrIiB2aWV3Qm94PSIwIDAgNTAwIDUwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB4PSIxNTUiIHk9IjYwIiB3aWR0aD0iMTkwIiBoZWlnaHQ9IjM5MCIgZmlsbD0iIzY5ZmYzNyIvPjwvc3ZnPg==")
-        ] {
-        println!("Resolving: {}", ens_name);
-        assert_eq!(provider.resolve_avatar(ens_name).await.unwrap(), Url::parse(res).unwrap());
-    }
     }
 
     #[tokio::test]
@@ -1690,183 +1368,5 @@ mod tests {
         let history =
             provider.fee_history(10u64, BlockNumber::Latest, &[10.0, 40.0]).await.unwrap();
         dbg!(&history);
-    }
-
-    #[tokio::test]
-    #[ignore]
-    #[cfg(feature = "ws")]
-    async fn test_trace_call_many() {
-        use ethers_core::types::H160;
-
-        // TODO: Implement ErigonInstance, so it'd be possible to test this.
-        let provider = Provider::new(crate::Ws::connect("ws://127.0.0.1:8545").await.unwrap());
-        let traces = provider
-            .trace_call_many(
-                vec![
-                    (
-                        TransactionRequest::new()
-                            .from(Address::zero())
-                            .to("0x0000000000000000000000000000000000000001"
-                                .parse::<H160>()
-                                .unwrap())
-                            .value(U256::from(10000000000000000u128)),
-                        vec![TraceType::StateDiff],
-                    ),
-                    (
-                        TransactionRequest::new()
-                            .from(
-                                "0x0000000000000000000000000000000000000001"
-                                    .parse::<H160>()
-                                    .unwrap(),
-                            )
-                            .to("0x0000000000000000000000000000000000000002"
-                                .parse::<H160>()
-                                .unwrap())
-                            .value(U256::from(10000000000000000u128)),
-                        vec![TraceType::StateDiff],
-                    ),
-                ],
-                None,
-            )
-            .await
-            .unwrap();
-        dbg!(traces);
-    }
-
-    #[tokio::test]
-    async fn test_fill_transaction_1559() {
-        let (mut provider, mock) = Provider::mocked();
-        provider.from = Some("0x6fC21092DA55B392b045eD78F4732bff3C580e2c".parse().unwrap());
-
-        let gas = U256::from(21000_usize);
-        let max_fee = U256::from(25_usize);
-        let prio_fee = U256::from(25_usize);
-        let access_list: AccessList = vec![Default::default()].into();
-
-        // --- leaves a filled 1559 transaction unchanged, making no requests
-        let from: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
-        let to: Address = "0x0000000000000000000000000000000000000002".parse().unwrap();
-        let mut tx = Eip1559TransactionRequest::new()
-            .from(from)
-            .to(to)
-            .gas(gas)
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(prio_fee)
-            .access_list(access_list.clone())
-            .into();
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), Some(&from));
-        assert_eq!(tx.to(), Some(&to.into()));
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.gas_price(), Some(max_fee));
-        assert_eq!(tx.access_list(), Some(&access_list));
-
-        // --- fills a 1559 transaction, leaving the existing gas limit unchanged, but including
-        // access list if cheaper
-        let gas_with_al = gas - 1;
-        let mut tx = Eip1559TransactionRequest::new()
-            .gas(gas)
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(prio_fee)
-            .into();
-
-        mock.push(AccessListWithGasUsed {
-            access_list: access_list.clone(),
-            gas_used: gas_with_al,
-        })
-        .unwrap();
-
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), provider.from.as_ref());
-        assert!(tx.to().is_none());
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.access_list(), Some(&access_list));
-
-        // --- fills a 1559 transaction, ignoring access list if more expensive
-        let gas_with_al = gas + 1;
-        let mut tx = Eip1559TransactionRequest::new()
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(prio_fee)
-            .into();
-
-        mock.push(AccessListWithGasUsed {
-            access_list: access_list.clone(),
-            gas_used: gas_with_al,
-        })
-        .unwrap();
-        mock.push(gas).unwrap();
-
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), provider.from.as_ref());
-        assert!(tx.to().is_none());
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.access_list(), Some(&Default::default()));
-
-        // --- fills a 1559 transaction, using estimated gas if create_access_list() errors
-        let mut tx = Eip1559TransactionRequest::new()
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(prio_fee)
-            .into();
-
-        // bad mock value causes error response for eth_createAccessList
-        mock.push(b'b').unwrap();
-        mock.push(gas).unwrap();
-
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), provider.from.as_ref());
-        assert!(tx.to().is_none());
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.access_list(), Some(&Default::default()));
-
-        // --- propogates estimate_gas() error
-        let mut tx = Eip1559TransactionRequest::new()
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(prio_fee)
-            .into();
-
-        // bad mock value causes error response for eth_estimateGas
-        mock.push(b'b').unwrap();
-
-        let res = provider.fill_transaction(&mut tx, None).await;
-
-        assert!(matches!(res, Err(ProviderError::JsonRpcClientError(_))));
-    }
-
-    #[tokio::test]
-    async fn test_fill_transaction_legacy() {
-        let (mut provider, mock) = Provider::mocked();
-        provider.from = Some("0x6fC21092DA55B392b045eD78F4732bff3C580e2c".parse().unwrap());
-
-        let gas = U256::from(21000_usize);
-        let gas_price = U256::from(50_usize);
-
-        // --- leaves a filled legacy transaction unchanged, making no requests
-        let from: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
-        let to: Address = "0x0000000000000000000000000000000000000002".parse().unwrap();
-        let mut tx =
-            TransactionRequest::new().from(from).to(to).gas(gas).gas_price(gas_price).into();
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), Some(&from));
-        assert_eq!(tx.to(), Some(&to.into()));
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.gas_price(), Some(gas_price));
-        assert!(tx.access_list().is_none());
-
-        // --- fills an empty legacy transaction
-        let mut tx = TransactionRequest::new().into();
-        mock.push(gas).unwrap();
-        mock.push(gas_price).unwrap();
-        provider.fill_transaction(&mut tx, None).await.unwrap();
-
-        assert_eq!(tx.from(), provider.from.as_ref());
-        assert!(tx.to().is_none());
-        assert_eq!(tx.gas(), Some(&gas));
-        assert_eq!(tx.gas_price(), Some(gas_price));
-        assert!(tx.access_list().is_none());
     }
 }
